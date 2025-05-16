@@ -1,12 +1,14 @@
-//! GPU k‑means (OpenCL‑GPU assignment, CPU update, f32)
-//! Работает на OpenCL 1.2 (pocl, старые драйверы) — без atomics и reduce‑intrinsics.
-//! CSV содержит **только признаки** (без меток).
-//! По завершении записывает итоговые центроиды в `<input>_centroids.csv`.
+//! GPU k‑means (OpenCL 1.2 friendly):
+//!   • GPU – assignment step (each work‑item = 1 точка)  
+//!   • CPU – update centroids  
+//! CSV файл содержит **только признаки**.  
+//! После сходимости центроиды сохраняются в `<input>_centroids.csv`.
+//! Работает даже под pocl/mesa; избегает atomics и group‑reduce.
 
+use std::{error::Error, fs::File, io::Write, path::Path, time::Instant};
 use clap::Parser;
 use csv::ReaderBuilder;
-use ocl::{Buffer, Kernel, ProQue};
-use std::{error::Error, fs::File, io::Write, path::Path, time::Instant};
+use ocl::{builders::KernelBuilder, Buffer, ProQue};
 
 #[derive(Clone)]
 struct Point {
@@ -15,105 +17,55 @@ struct Point {
 
 #[derive(Parser, Debug)]
 struct Args {
-    /// CSV‑файл с признаками
+    /// CSV с признаками
     #[clap(short = 'f', long)]
     file: String,
-    /// K кластеров
+    /// K кластеров
     #[clap(short = 'k', long, default_value_t = 8)]
     k: usize,
-    /// Максимум итераций
+    /// Макс. итераций
     #[clap(short = 'i', long = "iterations", default_value_t = 100)]
     iterations: usize,
-    /// Порог сходимости (макс |Δ| по координате)
+    /// Порог сходимости
     #[clap(short = 'e', long = "eps", default_value_t = 1e-3)]
     eps: f32,
-    /// Использовать GPU (иначе — чистый CPU)
+    /// Использовать GPU (без флага – только CPU)
     #[clap(short = 'o', long)]
     opencl: bool,
 }
 
-/// Чтение CSV без меток
+/// Читает CSV → Vec<Point> (только float‑признаки)
 fn read_points<P: AsRef<Path>>(p: P) -> Result<Vec<Point>, Box<dyn Error>> {
-    let mut rdr = ReaderBuilder::new()
-        .has_headers(false)
-        .from_reader(File::open(p)?);
-    let mut pts = Vec::new();
+    let mut rdr = ReaderBuilder::new().has_headers(false).from_reader(File::open(p)?);
+    let mut out = Vec::new();
     for rec in rdr.records() {
         let rec = rec?;
-        let feats: Vec<f32> = rec
-            .iter()
-            .map(|s| s.trim().parse::<f32>())
-            .collect::<Result<_, _>>()?;
-        pts.push(Point { features: feats });
+        let feats: Vec<f32> = rec.iter().map(|s| s.parse::<f32>().unwrap()).collect();
+        out.push(Point { features: feats });
     }
-    Ok(pts)
+    Ok(out)
 }
 
-/// Чистый CPU‑вариант (для бенча)
-fn kmeans_cpu(data: &[Point], k: usize, max_it: usize, eps: f32) -> (Vec<Vec<f32>>, usize) {
-    let n = data.len();
-    let d = data[0].features.len();
-    let mut centroids: Vec<Vec<f32>> = data[..k].iter().map(|p| p.features.clone()).collect();
-    let mut assign = vec![0usize; n];
-
-    for it in 0..max_it {
-        let mut moved = false;
-        // assignment
-        for (idx, p) in data.iter().enumerate() {
-            let (mut best_dist, mut best_k) = (f32::MAX, 0);
-            for (c_idx, c) in centroids.iter().enumerate() {
-                let dist = c
-                    .iter()
-                    .zip(&p.features)
-                    .map(|(a, b)| (a - b).powi(2))
-                    .sum::<f32>();
-                if dist < best_dist {
-                    best_dist = dist;
-                    best_k = c_idx;
-                }
-            }
-            if assign[idx] != best_k {
-                moved = true;
-            }
-            assign[idx] = best_k;
-        }
-        if !moved {
-            return (centroids, it);
-        }
-        // update on CPU
-        let mut sums = vec![vec![0f32; d]; k];
-        let mut cnt = vec![0usize; k];
-        for (idx, p) in data.iter().enumerate() {
-            let c = assign[idx];
-            cnt[c] += 1;
-            for j in 0..d {
-                sums[c][j] += p.features[j];
-            }
-        }
-        moved = false;
-        for c in 0..k {
-            if cnt[c] == 0 {
-                continue;
-            }
-            let inv = 1.0 / cnt[c] as f32;
-            for j in 0..d {
-                sums[c][j] *= inv;
-            }
-            let delta = sums[c]
-                .iter()
-                .zip(&centroids[c])
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0, f32::max);
-            if delta > eps {
-                moved = true;
-            }
-            centroids[c] = sums[c].clone();
-        }
-        if !moved {
-            return (centroids, it);
+/// CPU k‑means (Baseline / Update для GPU‑варианта)
+fn cpu_update(assign: &[u32], data: &[Point], k: usize, d: usize) -> Vec<f32> {
+    let mut sums = vec![vec![0f32; d]; k];
+    let mut cnt = vec![0u32; k];
+    for (idx, a) in assign.iter().enumerate() {
+        let c = *a as usize;
+        cnt[c] += 1;
+        for j in 0..d {
+            sums[c][j] += data[idx].features[j];
         }
     }
-    (centroids, max_it)
+    // new centroids
+    let mut centroids = vec![0f32; k * d];
+    for c in 0..k {
+        let inv = 1.0 / cnt[c].max(1) as f32; // avoid div 0
+        for j in 0..d {
+            centroids[c * d + j] = sums[c][j] * inv;
+        }
+    }
+    centroids
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
@@ -124,41 +76,74 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("Points: {n}, dim: {d}, K: {}", args.k);
 
     if !args.opencl {
-        let t = Instant::now();
-        let (_, iters) = kmeans_cpu(&data, args.k, args.iterations, args.eps);
-        println!("CPU done in {iters} iters, {:?}", t.elapsed());
+        // чисто CPU (для бенча)
+        let mut centroids: Vec<f32> = data[..args.k]
+            .iter()
+            .flat_map(|p| p.features.iter())
+            .copied()
+            .collect();
+        let t0 = Instant::now();
+        for it in 0..args.iterations {
+            // assignment (CPU)
+            let mut assign = vec![0u32; n];
+            for (idx, p) in data.iter().enumerate() {
+                let mut best = (f32::MAX, 0u32);
+                for c in 0..args.k {
+                    let dist: f32 = (0..d)
+                        .map(|j| {
+                            let diff = p.features[j] - centroids[c * d + j];
+                            diff * diff
+                        })
+                        .sum();
+                    if dist < best.0 {
+                        best = (dist, c as u32);
+                    }
+                }
+                assign[idx] = best.1;
+            }
+            let new_centroids = cpu_update(&assign, &data, args.k, d);
+            let delta = new_centroids
+                .iter()
+                .zip(&centroids)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0f32, f32::max);
+            centroids = new_centroids;
+            if delta < args.eps {
+                println!("Converged in {it} iterations, {:?}", t0.elapsed());
+                break;
+            }
+        }
         return Ok(());
     }
 
-    // GPU assignment kernel -------------------------------------------------
-    const SRC: &str = r#"
-    __kernel void assign_points(
+    // ---------- GPU вариант: assignment на GPU ----------
+    // Плоский массив признаков
+    let flat: Vec<f32> = data.iter().flat_map(|p| p.features.iter()).copied().collect();
+    let mut centroids: Vec<f32> = flat[..args.k * d].to_vec(); // init
+
+    // OpenCL
+    const SRC: &str = r#"__kernel void assign_points(
         __global const float* data,
-        __global const float* centroids,
+        __global const float* cent,
         __global uint* assign,
-        const uint D, const uint K)
+        const uint N, const uint D, const uint K)
     {
         uint gid = get_global_id(0);
+        if (gid >= N) return;
         float best = FLT_MAX;
-        uint best_k = 0u;
-        for(uint c=0u; c<K; ++c){
+        uint best_k = 0;
+        for (uint c = 0; c < K; ++c) {
             float dist = 0.0f;
-            for(uint j=0u; j<D; ++j){
-                float diff = data[gid*D + j] - centroids[c*D + j];
-                dist += diff*diff;
+            for (uint j = 0; j < D; ++j) {
+                float diff = data[gid * D + j] - cent[c * D + j];
+                dist += diff * diff;
             }
-            if(dist < best){ best = dist; best_k = c; }
+            if (dist < best) { best = dist; best_k = c; }
         }
         assign[gid] = best_k;
     }"#;
 
-    // подготовка данных
-    let flat: Vec<f32> = data
-        .iter()
-        .flat_map(|p| p.features.iter())
-        .copied()
-        .collect();
-    let mut centroids: Vec<f32> = flat[..args.k * d].to_vec();
+    // Размеры: work‑group = 64; глобальный = кратно 64 ≥ N
     let wg = 64usize;
     let global = ((n + wg - 1) / wg) * wg;
 
@@ -178,7 +163,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .len(n)
         .build()?;
 
-    let mut kernel = Kernel::builder()
+    let mut kernel = KernelBuilder::new()
         .program(&pro_que.program())
         .name("assign_points")
         .queue(pro_que.queue().clone())
@@ -187,71 +172,47 @@ fn main() -> Result<(), Box<dyn Error>> {
         .arg(&data_buf)
         .arg(&cent_buf)
         .arg(&assign_buf)
+        .arg(&(n as u32))
         .arg(&(d as u32))
         .arg(&(args.k as u32))
         .build()?;
 
-    let mut assignments = vec![0u32; n];
+    // ---- основной цикл ----
     let t0 = Instant::now();
     for it in 0..args.iterations {
-        // write centroids to device
-        cent_buf.write(&centroids).enq()?;
-
-        unsafe {
-            kernel.enq()?;
-        }
+        unsafe { kernel.enq()?; }
         pro_que.queue().finish()?;
 
-        // read assignments back
-        assign_buf.read(&mut assignments).enq()?;
+        // читаем assignment
+        let mut assign = vec![0u32; n];
+        assign_buf.read(&mut assign).enq()?;
 
-        // CPU update phase
-        let mut sums = vec![vec![0f32; d]; args.k];
-        let mut cnt = vec![0usize; args.k];
-        for (idx, &c_idx) in assignments.iter().enumerate() {
-            let c = c_idx as usize;
-            cnt[c] += 1;
-            let feat_slice = &flat[idx * d..(idx + 1) * d];
-            for j in 0..d {
-                sums[c][j] += feat_slice[j];
-            }
-        }
-        let mut max_delta = 0f32;
-        for c in 0..args.k {
-            if cnt[c] == 0 {
-                continue;
-            }
-            let inv = 1.0 / cnt[c] as f32;
-            for j in 0..d {
-                sums[c][j] *= inv;
-            }
-            let delta = sums[c]
-                .iter()
-                .zip(&centroids[c * d..(c + 1) * d])
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0, f32::max);
-            max_delta = max_delta.max(delta);
-            // copy back to flat centroids vec
-            for j in 0..d {
-                centroids[c * d + j] = sums[c][j];
-            }
-        }
-        if max_delta < args.eps {
+        // CPU обновляет центроиды
+        let new_centroids = cpu_update(&assign, &data, args.k, d);
+        // проверяем сходимость
+        let delta = new_centroids
+            .iter()
+            .zip(&centroids)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        centroids.copy_from_slice(&new_centroids);
+        cent_buf.write(&centroids).enq()?;
+        if delta < args.eps {
             println!("Converged in {it} iterations, {:?}", t0.elapsed());
             break;
         }
     }
-    println!("Total GPU time: {:?}", t0.elapsed());
+    println!("Total GPU‑loop time: {:?}", t0.elapsed());
 
-    // ---------- save centroids ----------
+    // -------- сохранить центроиды --------
     let out_path = format!("{}_centroids.csv", args.file.trim_end_matches(".csv"));
     let mut f = File::create(&out_path)?;
     for c in 0..args.k {
-        let row: Vec<String> = centroids[c * d..(c + 1) * d]
-            .iter()
-            .map(|v| v.to_string())
-            .collect();
-        writeln!(f, "{}", row.join(","))?;
+        for j in 0..d {
+            if j > 0 { write!(f, ",")?; }
+            write!(f, "{}", centroids[c * d + j])?;
+        }
+        writeln!(f)?;
     }
     println!("Centroids saved to {out_path}");
     Ok(())
