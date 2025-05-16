@@ -1,12 +1,11 @@
-//! GPU k‑means (assignment + update on OpenCL, тип данных f32)
-//! Совместим с CSV без столбца меток. Каждая строка — только признаки.
+//! GPU k‑means (assignment on OpenCL, update on CPU, тип данных f32)
+//! CSV содержит только признаки (без меток).
 
-use std::{error::Error, fs::File, path::Path, time::Instant};
 use clap::Parser;
 use csv::ReaderBuilder;
 use ocl::{builders::KernelBuilder, Buffer, ProQue};
+use std::{error::Error, fs::File, path::Path, time::Instant};
 
-/// Точка: только признаки
 #[derive(Debug, Clone)]
 struct Point {
     features: Vec<f32>,
@@ -14,120 +13,99 @@ struct Point {
 
 #[derive(Parser, Debug)]
 struct Args {
-    /// Путь к CSV с признаками
+    /// CSV‑файл с признаками
     #[clap(short = 'f', long)]
     file: String,
-    /// Кол‑во кластеров
+    /// Количество кластеров
     #[clap(short = 'k', long, default_value_t = 8)]
     k: usize,
-    /// Макс. итераций
+    /// Максимум итераций
     #[clap(short = 'i', long = "iterations", default_value_t = 100)]
     iterations: usize,
-    /// Порог сходимости L∞ по координатам центроидов
+    /// Порог сходимости
     #[clap(short = 'e', long = "eps", default_value_t = 1e-3)]
     eps: f32,
-    /// Включить расчёт на GPU (без флага — CPU)
+    /// Запускать GPU (если не указан, используется чистый CPU)
     #[clap(short = 'o', long)]
     opencl: bool,
 }
 
-/// CSV → Vec<Point> (все столбцы — f32, без меток)
+/// CSV → Vec<Point> (все столбцы — признаки)
 fn read_points<P: AsRef<Path>>(p: P) -> Result<Vec<Point>, Box<dyn Error>> {
     let mut rdr = ReaderBuilder::new()
         .has_headers(false)
         .from_reader(File::open(p)?);
-
-    let mut pts = Vec::new();
+    let mut pts = Vec::<Point>::new();
     for rec in rdr.records() {
         let rec = rec?;
-        if rec.is_empty() {
-            continue; // пропускаем пустые строки
-        }
         let feats: Vec<f32> = rec
             .iter()
-            .map(|s| s.trim().parse::<f32>())
+            .map(|s| s.parse::<f32>())
             .collect::<Result<_, _>>()?;
         pts.push(Point { features: feats });
-    }
-    if pts.is_empty() {
-        return Err("CSV не содержит ни одной точки".into());
     }
     Ok(pts)
 }
 
-/// Однопоточный CPU‑k‑means (для сравнения)
+/// CPU‑k‑means (однопоточный) — для проверки и сравнения
 fn kmeans_cpu(data: &[Point], k: usize, max_it: usize, eps: f32) -> (Vec<Vec<f32>>, usize) {
     let n = data.len();
     let d = data[0].features.len();
-
-    // Первые K точек — начальные центроиды
-    let mut centroids: Vec<Vec<f32>> = data[..k]
-        .iter()
-        .map(|p| p.features.clone())
-        .collect();
-    let mut assignments = vec![0usize; n];
-    let mut tmp = vec![vec![0f32; d]; k];
-    let mut counts = vec![0usize; k];
+    let mut centroids: Vec<Vec<f32>> = data[..k].iter().map(|p| p.features.clone()).collect();
+    let mut assign = vec![0usize; n];
 
     for it in 0..max_it {
-        let mut moved = false;
-        // Шаг назначения
+        // assignment
+        let mut changed = false;
         for (idx, p) in data.iter().enumerate() {
             let (mut best_dist, mut best_k) = (f32::MAX, 0usize);
-            for (ci, c) in centroids.iter().enumerate() {
-                let dist = c
+            for (c_idx, c) in centroids.iter().enumerate() {
+                let dist: f32 = c
                     .iter()
                     .zip(&p.features)
                     .map(|(a, b)| (a - b).powi(2))
-                    .sum::<f32>();
+                    .sum();
                 if dist < best_dist {
                     best_dist = dist;
-                    best_k = ci;
+                    best_k = c_idx;
                 }
             }
-            if assignments[idx] != best_k {
-                moved = true;
+            if assign[idx] != best_k {
+                changed = true;
+                assign[idx] = best_k;
             }
-            assignments[idx] = best_k;
         }
-        if !moved {
+        if !changed {
             return (centroids, it);
         }
-
-        // Обнуление аккумуляторов
-        tmp.iter_mut().for_each(|v| v.fill(0.0));
-        counts.fill(0);
-
-        // Накопление сумм
+        // update on CPU
+        let mut sums = vec![vec![0.0f32; d]; k];
+        let mut cnts = vec![0usize; k];
         for (idx, p) in data.iter().enumerate() {
-            let c = assignments[idx];
-            counts[c] += 1;
+            let c = assign[idx];
+            cnts[c] += 1;
             for j in 0..d {
-                tmp[c][j] += p.features[j];
+                sums[c][j] += p.features[j];
             }
         }
-
-        // Обновление центроидов
-        moved = false;
+        let mut max_delta = 0.0f32;
         for c in 0..k {
-            if counts[c] == 0 {
-                continue; // пустой кластер — пропускаем
+            if cnts[c] == 0 {
+                continue; // пустой кластер
             }
-            let inv = 1.0 / counts[c] as f32;
+            let inv = 1.0 / cnts[c] as f32;
             for j in 0..d {
-                tmp[c][j] *= inv;
+                sums[c][j] *= inv;
             }
-            let delta = tmp[c]
+            let delta = sums[c]
                 .iter()
                 .zip(&centroids[c])
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0, f32::max);
-            if delta > eps {
-                moved = true;
-            }
-            centroids[c] = tmp[c].clone();
+            max_delta = max_delta.max(delta);
+            centroids[c] = sums[c].clone();
         }
-        if !moved {
+        if max_delta < eps {
             return (centroids, it);
         }
     }
@@ -139,122 +117,66 @@ fn main() -> Result<(), Box<dyn Error>> {
     let data = read_points(&args.file)?;
     let n = data.len();
     let d = data[0].features.len();
-
     println!("Points: {n}, dim: {d}, K: {}", args.k);
 
-    // ---------- CPU ----------
+    // ---------------- CPU ONLY ----------------
     if !args.opencl {
-        let t = Instant::now();
+        let t0 = Instant::now();
         let (_, iters) = kmeans_cpu(&data, args.k, args.iterations, args.eps);
-        println!("CPU done in {iters} iters, {:?}", t.elapsed());
+        println!("CPU done in {iters} iterations, {:?}", t0.elapsed());
         return Ok(());
     }
 
-    // -------------------- GPU PART --------------------
-    // Плоский массив данных size = N×D
+    // ---------------- GPU ASSIGNMENT ----------------
+    // flatten dataset
     let flat: Vec<f32> = data
         .iter()
         .flat_map(|p| p.features.iter())
         .copied()
         .collect();
-
-    // Начальные центроиды = первые K точек
     let mut centroids: Vec<f32> = flat[..args.k * d].to_vec();
+    let mut assign_host = vec![0u32; n];
 
-    // OpenCL kernel source
-    const SRC: &str = r#"    
-    __kernel void assign_points(
-        __global const float* data,          // N×D
-        __global float* centroids,           // K×D
-        __global uint*  assign,              // N
-        __global float* partial_sums,        // groups × K × D
-        __global uint*  partial_counts,      // groups × K
-        const uint D, const uint K)
+    // простейший kernel только для шага assignment (без атомиков, без reduce‑builtin)
+    const SRC: &str = r#"__kernel void assign_points(
+        __global const float* data,
+        __global const float* centroids,
+        __global uint* assign,
+        const uint D,
+        const uint K)
     {
         uint gid = get_global_id(0);
-        uint lid = get_local_id(0);
-        uint gsize = get_global_size(0);
-
-        __local float lcent[1024];           // убедитесь, что K*D <= 1024
-        for (uint i = lid; i < K * D; i += get_local_size(0))
-            lcent[i] = centroids[i];
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        if (gid >= gsize) return;
-
-        // поиск ближайшего центроида
+        // каждая нить обрабатывает одну точку
         float best = FLT_MAX;
         uint  best_k = 0;
         for (uint c = 0; c < K; ++c) {
             float dist = 0.0f;
             for (uint j = 0; j < D; ++j) {
-                float diff = data[gid * D + j] - lcent[c * D + j];
+                float diff = data[gid * D + j] - centroids[c * D + j];
                 dist += diff * diff;
             }
             if (dist < best) { best = dist; best_k = c; }
         }
         assign[gid] = best_k;
-
-        // локальные буферы для частичных сумм
-        __local float lsum[1024];
-        __local uint  lcnt[128];
-        for (uint i = lid; i < K * D; i += get_local_size(0)) lsum[i] = 0.0f;
-        for (uint i = lid; i < K;     i += get_local_size(0)) lcnt[i] = 0;
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        // аккумулируем точку
-        for (uint j = 0; j < D; ++j)
-            atomic_add(&lsum[best_k * D + j], data[gid * D + j]);
-        atomic_inc(&lcnt[best_k]);
-        barrier(CLK_LOCAL_MEM_FENCE);
-
-        // нить 0 группы пишет результаты в глобальную память
-        if (lid == 0) {
-            uint grp = get_group_id(0);
-            for (uint c = 0; c < K; ++c) {
-                uint base = (grp * K + c) * D;
-                for (uint j = 0; j < D; ++j)
-                    partial_sums[base + j] = lsum[c * D + j];
-                partial_counts[grp * K + c] = lcnt[c];
-            }
-        }
-    }
-
-    __kernel void update_centroids(
-        __global float* centroids,
-        __global float* partial_sums,
-        __global uint*  partial_counts,
-        const uint groups, const uint D, const uint K)
-    {
-        uint k = get_global_id(0);
-        if (k >= K) return;
-        float sum;
-        uint cnt = 0;
-        for (uint g = 0; g < groups; ++g) {
-            cnt += partial_counts[g * K + k];
-            for (uint j = 0; j < D; ++j) {
-                sum = work_group_reduce_add(partial_sums[(g * K + k) * D + j]);
-            }
-        }
-        if (cnt == 0) return; // пустой кластер — сохраняем старый центроид
-        for (uint j = 0; j < D; ++j)
-            centroids[k * D + j] = sum / (float)cnt;
     }"#;
 
-    // Размеры сетки
-    let wg = 64usize;                   // work‑group size
-    let global = ((n + wg - 1) / wg) * wg; // округляем вверх
-    let groups = global / wg;
+    let wg = 64usize;
+    let global = ((n + wg - 1) / wg) * wg;
 
-    let pro_que = ProQue::builder().src(SRC).dims(global).build()?;
+    let pro_que = ProQue::builder()
+        .src(SRC)
+        .dims(global)
+        // ограничиваемся OpenCL 1.2
+        .prog_bldr(|b| b.cmplt().cpp_define("CL_TARGET_OPENCL_VERSION", "120"))
+        .build()?;
 
-    // Буферы
+    // буферы
     let data_buf = Buffer::<f32>::builder()
         .queue(pro_que.queue().clone())
         .len(flat.len())
         .copy_host_slice(&flat)
         .build()?;
-    let mut cent_buf = Buffer::<f32>::builder()
+    let cent_buf = Buffer::<f32>::builder()
         .queue(pro_que.queue().clone())
         .len(centroids.len())
         .copy_host_slice(&centroids)
@@ -263,16 +185,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         .queue(pro_que.queue().clone())
         .len(n)
         .build()?;
-    let part_sum_buf = Buffer::<f32>::builder()
-        .queue(pro_que.queue().clone())
-        .len(groups * args.k * d)
-        .build()?;
-    let part_cnt_buf = Buffer::<u32>::builder()
-        .queue(pro_que.queue().clone())
-        .len(groups * args.k)
-        .build()?;
 
-    // --- kernels
     let mut assign_kernel = KernelBuilder::new()
         .program(&pro_que.program())
         .name("assign_points")
@@ -282,52 +195,63 @@ fn main() -> Result<(), Box<dyn Error>> {
         .arg(&data_buf)
         .arg(&cent_buf)
         .arg(&assign_buf)
-        .arg(&part_sum_buf)
-        .arg(&part_cnt_buf)
         .arg(&(d as u32))
         .arg(&(args.k as u32))
         .build()?;
 
-    let mut update_kernel = KernelBuilder::new()
-        .program(&pro_que.program())
-        .name("update_centroids")
-        .queue(pro_que.queue().clone())
-        .global_work_size(args.k)
-        .arg(&cent_buf)
-        .arg(&part_sum_buf)
-        .arg(&part_cnt_buf)
-        .arg(&(groups as u32))
-        .arg(&(d as u32))
-        .arg(&(args.k as u32))
-        .build()?;
-
-    // ---------- Итерации ----------
-    let start = Instant::now();
-    let mut prev_centroids = centroids.clone();
-
+    // ----- основной цикл -----
+    let t0 = Instant::now();
     for it in 0..args.iterations {
-        unsafe { assign_kernel.enq()?; }
-        unsafe { update_kernel.enq()?; }
+        // шаг assignment на GPU
+        unsafe {
+            assign_kernel.enq()?;
+        }
         pro_que.queue().finish()?;
 
-        // читаем новые центроиды
-        cent_buf.read(&mut centroids).enq()?;
+        // читаем назначения
+        assign_buf.read(&mut assign_host).enq()?;
 
-        // проверка сходимости
-        let delta = centroids
-            .iter()
-            .zip(&prev_centroids)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0, f32::max);
-        if delta < args.eps {
-            println!("Converged in {it} iterations, {:?}", start.elapsed());
+        // update на CPU
+        let mut sums = vec![vec![0.0f32; d]; args.k];
+        let mut cnts = vec![0usize; args.k];
+        for (idx, p) in data.iter().enumerate() {
+            let c = assign_host[idx] as usize;
+            cnts[c] += 1;
+            for j in 0..d {
+                sums[c][j] += p.features[j];
+            }
+        }
+        let mut max_delta = 0.0f32;
+        for c in 0..args.k {
+            if cnts[c] == 0 {
+                continue;
+            }
+            let inv = 1.0 / cnts[c] as f32;
+            for j in 0..d {
+                sums[c][j] *= inv;
+            }
+            let delta = sums[c]
+                .iter()
+                .zip(centroids[c * d..(c + 1) * d].iter())
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            max_delta = max_delta.max(delta);
+            // записываем в массив центроидов подряд
+            for j in 0..d {
+                centroids[c * d + j] = sums[c][j];
+            }
+        }
+        if max_delta < args.eps {
+            println!("Converged in {it} iterations, {:?}", t0.elapsed());
             break;
         }
-        prev_centroids.copy_from_slice(&centroids);
-
-        // записываем центроиды обратно в буфер
+        // передаём обновлённые центроиды на устройство
         cent_buf.write(&centroids).enq()?;
     }
-    println!("Total GPU time: {:?}", start.elapsed());
+
+    println!(
+        "Total wall time (GPU assignment + CPU update): {:?}",
+        t0.elapsed()
+    );
     Ok(())
 }
